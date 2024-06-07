@@ -232,3 +232,15 @@ def collate_fn(x):
     x = {key: [x_i[key] for x_i in x] for key in all_keys}
 
     return x
+        
+def calculate_grad_penalty(loss, params, create_graph=True):
+    
+    grad_params = torch.autograd.grad(
+        outputs=loss, inputs=params, create_graph=create_graph
+    )
+    norm = 0 
+    for grad in grad_params:
+        norm += grad.pow(2).sum()
+    loss += norm.sqrt() 
+    
+    return loss 

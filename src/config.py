@@ -52,7 +52,7 @@ class TrainingState:
     num_batch_training_so_far : int = field(default=0, metadata={"help": "Number of batches trained so far."})
     num_tokens_so_far : int = 0
     num_steps_per_epoch : int = field(default=-1, metadata={"help": "Number of gradient updates per epoch."})
-    
+    loss : float = 0.0
     
 @dataclass
 class TrainingConfig: #TODO: should `num_processes` be set here since we cannot control from here?
@@ -88,7 +88,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     gradient_clip_norm: Union[int, str] = field(default=3.0, metadata={"help": "Norm for gradient clipping, if -1 or `inf`, no clipping."})
     gradient_clip_value: Union[int, str] = field(default=3.0, metadata={"help": "Value for gradient clipping, if -1, `inf` clipping."})
     tokenizer_name_or_path: str = field(default="", metadata={"help": "Path to local directory or name of huggingface repo_id of the tokenizer."})
-    mixed_precision: str = field(default="fp16", metadata={"help": "Whether to use mixed precision training. Available options: 'fp16', 'fp32', 'no'."})
+    mixed_precision: str = field(default="fp16", metadata={"help": "Whether to use mixed precision training. Available options: 'fp16', 'bfp16', 'off'."})
     device: str = field(default="cuda", metadata={"help": "Device for training. Note that this script is only supported on GPU. (so do not change this)"})
     seed: int = field(default=42, metadata={"help": "Seed for random number generation."})
     seed_for_each_worker : bool = field(default=False, metadata={"help": "Each worker will have a different seed: seed_worker = config.seed + rank."}) 
@@ -253,6 +253,10 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
             else:
                 raise ValueError("model_input_name must be a list, tuple, or string. But got: {self.model_input_name}")
         
+        if self.mixed_precision == "bfp16":
+            if self.device == "cpu":
+                raise ValueError("BFloat16 is not supported on CPU.")
+            
         if self.attn_implementation not in ["sdpa", "flash_attention_2", "eager"]:
             raise ValueError(f"Invalid attention implementation: {self.attn_implementation}, available options: 'sdpa', 'flash_attention_2', 'eager'.")
         
@@ -262,12 +266,14 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     @property
     def precision(self):
         assert hasattr(self, "is_post_init"), "Call _post_init() first."
-        if self.mixed_precision == "fp16" or self.mixed_precision == "no":
+        if self.mixed_precision == "fp16":
             return torch.float16
-        elif self.mixed_precision == "fp32":
+        elif self.mixed_precision == 'bfp16':
+            return torch.bfloat16 
+        elif self.mixed_precision == "off":
             return torch.float32
         else:
-            raise ValueError(f"Invalid mixed precision: {self.mixed_precision}, available options: 'fp16', 'fp32', 'no'.")
+            raise ValueError(f"Invalid mixed precision: {self.mixed_precision}, available options: 'fp16', 'bfp16', 'off'.")
         
     @property
     def print_option(self):

@@ -56,8 +56,8 @@ class Trainer:
         self._should_log_flops = False
         self._model_num_params = None 
         self._step = 0  
-        self._has_been_skipped = False
         self._collate_fn = collate_fn
+        self.should_sync = False
         self.train_dataset = kwargs.get("train_dataset", None)
         self.eval_dataset = kwargs.get("eval_dataset", None)
         self.optimizer = kwargs.get("optimizer", None)
@@ -74,6 +74,9 @@ class Trainer:
             self.config.attn_implementation = "flash_attention_2"
         else: 
             torch.backends.cuda.enable_mem_efficient_sdp(enabled=True) 
+        self.gradient_scaler = None 
+        if self.config.precision in ["fp16", "bfp32"]:
+            self.gradient_scaler = torch.amp.GradScaler() # maybe just use enabled=False
         if self.model is not None:
             self.model = self._model_post_init(self.model)
             self._is_model_initialized = True
@@ -83,6 +86,8 @@ class Trainer:
         if tokenizer is None: 
             if self.config.tokenizer_name_or_path is not None:
                 self.tokenizer = get_tokenizer(self.config.tokenizer_path)
+        self.tb_log_dir = None # will be set later
+        
     @property
     def _device(self):
         '''Get the device: `device:rank`'''
@@ -136,13 +141,14 @@ class Trainer:
         return model
             
     def _init_tensorboard(self, dir_path: str=None):
-        dir_path = os.path.join(os.getcwd(), self.output_trial_dir, tensorboard_log_dir) if dir_path is None else dir_path
-        self.writer = SummaryWriter(log_dir=dir_path)
-        log_on_main(f"Tensorboard initialized at {dir_path}")
-    
+        self.tb_log_dir = os.path.join(os.getcwd(), self.output_trial_dir, tensorboard_log_dir) if dir_path is None else dir_path
+        self.writer = SummaryWriter(log_dir=self.tb_log_dir)
+        log_on_main(f"Tensorboard initialized at {self.tb_log_dir}")
+
     def train(self, resume_from_checkpoint=True):
         """Main training loop method. If `resume_from_checkpoint` is True, 
             it will try to find potential checkpointing, or can be passed directly as path. """
+        prepare_start = time.time()
         arg = self.config
         self.state.is_in_train = True
         self.state.trial_name = arg.trial_name
@@ -225,62 +231,76 @@ class Trainer:
         for i, v in print_configs.items(): 
             log_on_main(f"|| \033[1m\033[1;31m{i}\033[0m: \033[0;30m{v}\033[0m") 
         D.barrier()
+        prepare_end = time.time() - prepare_start
+        log_on_main(f"Preparation took {prepare_end:.2f} seconds")
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> START TRAINING <<-----------------------------------------------\033[0m")
         
-        for epoch in range(starting_epoch, num_epochs):
+        on_trace = False if self.tb_log_dir is None else torch.profiler.tensorboard_trace_handler(self.tb_log_dir)
+        with torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=3, warmup=2, active=5, repeat=5),
+            on_trace_ready=on_trace,
+            profile_memory=True,
+            with_flops=True,
+            with_modules=True,
+            use_cuda=cuda.is_available(),
+            with_stack=True
+        ) as prof:
             
-            self.state.global_epoch = epoch
-            epoch_start_time = time.time()
-            self.model.train()
-            self.model.zero_grad()
-            self.optimizer.zero_grad()
-            
-            if hasattr(self.train_dataset, "set_epoch"):
-                self.train_dataset.set_epoch(epoch)
-            
-            for step, inputs in enumerate(self.train_dataset):
-                while num_batch_to_skip > 0:
-                    num_batch_to_skip -= 1
-                    if num_batch_to_skip == 0:
-                        logger.warning(f"Skipped {num_batch_to_skip} batches")
-                    continue
-                    
-                loss = self.inner_loop(inputs=inputs)       
-                self.state.num_batch_training_so_far += 1
-
-                if self.state.num_batch_training_so_far % arg.log_interval == 0:
-                    if D.get_rank() == 0 and D.get_rank() == 0:
-                        loss = loss / arg.log_interval
-                        lr = self.scheduler.get_last_lr()[0]
-                        message = f"EPOCH: {epoch}, GLOBAL_TRAINING_STEPS: {self.state.global_training_step}, BATCH_STEPS: {step}, LOSS: {loss:.4f}, LR: {lr:.4f}" 
-                        logger.warning(message)
-                        self.writer.add_scalar("train/loss", loss, self.state.global_training_step)
-                        self.writer.add_scalar("train/lr", lr, self.state.global_training_step)
-                    D.barrier()
-                    
-                if self.state.num_batch_training_so_far % arg.checkpoint_interval == 0:
-                    if D.get_rank() == 0:
-                        save_checkpoint(
-                            checkpoint_dir=self.output_trial_dir,
-                            model=self.model, 
-                            optimizer=self.optimizer, 
-                            scheduler=self.scheduler, 
-                            training_config=arg, 
-                            training_state=self.state, 
-                        )
-                        logger.warning(f"Checkpoint saved at global_training_step: {self.state.global_training_step}")
-                    D.barrier()
+            for epoch in range(starting_epoch, num_epochs):
                 
-            self.state.global_epoch += 1
-            epoch_end_time = time.time()
-            epoch_time = epoch_end_time - epoch_start_time
-            logger.warning(f"Epoch {epoch} took {epoch_time:.2f} seconds")
-            if self.state.global_training_step >= total_training_steps:
-                logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
-                break
-        self.state.is_in_train = False  
-        D.barrier()
-        log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
+                self.state.global_epoch = epoch
+                epoch_start_time = time.time()
+                self.model.train()
+                self.model.zero_grad()
+                self.optimizer.zero_grad()
+                
+                if hasattr(self.train_dataset, "set_epoch"):
+                    self.train_dataset.set_epoch(epoch)
+                
+                for step, inputs in enumerate(self.train_dataset):
+                    while num_batch_to_skip > 0:
+                        num_batch_to_skip -= 1
+                        if num_batch_to_skip == 0:
+                            logger.warning(f"Skipped {num_batch_to_skip} batches")
+                        continue
+                        
+                    loss = self.inner_loop(inputs=inputs)       
+                    self.state.num_batch_training_so_far += 1
+
+                    if self.state.num_batch_training_so_far % arg.log_interval == 0:
+                        if D.get_rank() == 0 and D.get_rank() == 0:
+                            loss = loss / arg.log_interval
+                            lr = self.scheduler.get_last_lr()[0]
+                            message = f"EPOCH: {epoch}, GLOBAL_TRAINING_STEPS: {self.state.global_training_step}, BATCH_STEPS: {step}, LOSS: {loss:.4f}, LR: {lr:.4f}" 
+                            logger.warning(message)
+                            self.writer.add_scalar("train/loss", loss, self.state.global_training_step)
+                            self.writer.add_scalar("train/lr", lr, self.state.global_training_step)
+                        D.barrier()
+                        
+                    if self.state.num_batch_training_so_far % arg.checkpoint_interval == 0:
+                        if D.get_rank() == 0:
+                            save_checkpoint(
+                                checkpoint_dir=self.output_trial_dir,
+                                model=self.model, 
+                                optimizer=self.optimizer, 
+                                scheduler=self.scheduler, 
+                                training_config=arg, 
+                                training_state=self.state, 
+                            )
+                            logger.warning(f"Checkpoint saved at global_training_step: {self.state.global_training_step}")
+                        D.barrier()
+                    
+                    prof.step() # we will profile every step (batch)
+                self.state.global_epoch += 1
+                epoch_end_time = time.time()
+                epoch_time = epoch_end_time - epoch_start_time
+                logger.warning(f"Epoch {epoch} took {epoch_time:.2f} seconds")
+                if self.state.global_training_step >= total_training_steps:
+                    logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
+                    break
+            self.state.is_in_train = False  
+            D.barrier()
+            log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
         
     def sample(self, inputs, *args, **kwargs):
         """Override this method for custome behavior for how the inputs should be sampled."""
@@ -312,7 +332,6 @@ class Trainer:
             grad_step = 1
         self._steps += 1
         self.should_sync = self._steps % grad_step == 0  
-        self._has_been_skipped = not self.should_sync
         
         with contextlib.ExitStack() as stack:
             if not self.should_sync: # if not self.should_sync then return will yield null context else yield mode.no_sync 
@@ -321,19 +340,41 @@ class Trainer:
                 stack.enter_context(contextlib.nullcontext())
             yield 
     
+    def step(self, loss):
+        '''Stepping optimizer and scheduler. Wiill do necessary scaling here'''
+        if self.gradient_scaler is not None:
+            self.gradient_scaler.scale(loss).backward()
+        loss = loss.detach()
+        if self.should_sync: # gradient synchronous steps
+            if self.gradient_scaler is not None:
+                
+                self.gradient_scaler.unscale_(self.optimizer)# explicitly call upscale for clipping
+                if self.config.gradient_clip_norm > 0.:
+                    torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.config.gradient_clip_norm)
+                if self.config.gradient_clip_value > 0.:
+                    torch.nn.utils.clip_grad_value_(self.model.module.parameters(), self.config.gradient_clip_value)
+                
+                self.gradient_scaler.step(self.optimizer) # will not internally call `unscale_` again
+                self.gradient_scaler.update() 
+            else: 
+                self.optimizer.step()
+                
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+            self.state.global_training_step += 1
+        
+        return loss 
+    
     def inner_loop(self, inputs, *args, **kwargs):
         """Inner training loop, reponsible for forward, backwarn pass, optimizer and lr step, and gradient accumulation."""
         
         with self.accumulate(self.model):
-            
-            loss = self.compute_loss(inputs)
-            loss = loss / self.config.gradient_accumulation_steps
-            loss.backward()
-            
-        if self.should_sync:
-            self.optimizer.step()
-            self.scheduler.step()
-            
+            with torch.autocast(enabled=self.config.mixed_precision != "off", cache_enabled=False):
+                loss = self.compute_loss(inputs)
+                loss = loss / self.config.gradient_accumulation_steps
+        
+        loss = self.step(loss)
+        self.state.loss = loss
         if self.config.report_nan:
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.error(f"Loss is NaN or Inf at epoch {self.state.global_epoch}, step {self.state.global_training_step}, loss: {loss}")
@@ -342,19 +383,7 @@ class Trainer:
         if hasattr(self.model, "floating_point_ops") and self._should_log_flops:
             self._curr_FLOPS = self.model.floating_point_ops(inputs)
             self._acc_FLOPS += self._curr_FLOPS
-        
-        if self.state.global_training_step % self.config.gradient_accumulation_steps == 0:
             
-            if self.config.gradient_clip_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip_norm)
-            if self.config.gradient_clip_value > 0.0:
-                torch.nn.utils.clip_grad_value_(self.model.parameters(), self.config.gradient_clip_value)
-                
-            self.optimizer.zero_grad()
-            self.state.global_training_step += 1
-            
-        loss = loss.item()
-        log_on_main(f"Done Iteration: {self.state.global_training_step}, Loss: {loss:.4f}")
         return loss
 
     def compute_loss(self, inputs, *args, **kwargs):
