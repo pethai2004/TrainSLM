@@ -26,6 +26,7 @@ TRAINING_STATE_PATH = 'training_state'
 TRAINING_CONFIG_PATH = 'training_config'
 DATALOADER_PATH = 'dataloader.bin'
 tensorboard_log_dir = 'logs'
+profiler_log_dir = 'profiler'
 _default_port = 6006 # default port for tensorboard
 non_decay_cls = (torch.nn.LayerNorm, torch.nn.Embedding)
 default_optim_cls = torch.optim.AdamW

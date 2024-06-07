@@ -1,14 +1,11 @@
 # Full training script 
 import os 
 import logging 
-import subprocess
-import logging
-import tqdm
-from typing import Dict, List, Any, Union, Tuple
+from typing import Dict, Any, Union, Tuple
 from contextlib import contextmanager, ExitStack, nullcontext
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, DistributedSampler
@@ -67,16 +64,16 @@ class Trainer:
         
         os.makedirs(self.output_trial_dir, exist_ok=True)
         self.state = TrainingState()
-        # will always not raise regardless of the availability of the flash_attn_2
         self._set_seed()
         torch.backends.cuda.enable_flash_sdp(enabled=True) #(always default to flash_attn_2)
         if tfm.modeling_utils.is_flash_attn_2_available():
             self.config.attn_implementation = "flash_attention_2"
         else: 
             torch.backends.cuda.enable_mem_efficient_sdp(enabled=True) 
-        self.gradient_scaler = None 
-        if self.config.precision in ["fp16", "bfp32"]:
-            self.gradient_scaler = torch.amp.GradScaler() # maybe just use enabled=False
+        # set grad scaler
+        self.enabling_scaler = self.config.mixed_precision in ["fp16", "bfp16"] and cuda.is_available()
+        self.gradient_scaler = cuda.amp.GradScaler(enabled=self.enabling_scaler) 
+        
         if self.model is not None:
             self.model = self._model_post_init(self.model)
             self._is_model_initialized = True
@@ -135,7 +132,7 @@ class Trainer:
         if isinstance(model, nn.Module):
             self._model_num_params = model.num_parameters()
             device = self._device
-            model.to(device=device, dtype=self.config.precision)
+            model.to(device=device, dtype=torch.float32) #TODO change config dtype, and option for mixed precision
             device_ids = None if not cuda.is_available() else [device]
             model = DDP(model, device_ids=device_ids, output_device=device) # just set output_device to the current device (TODO: add Parallel)
         return model
@@ -148,13 +145,13 @@ class Trainer:
     def train(self, resume_from_checkpoint=True):
         """Main training loop method. If `resume_from_checkpoint` is True, 
             it will try to find potential checkpointing, or can be passed directly as path. """
-        prepare_start = time.time()
         arg = self.config
         self.state.is_in_train = True
         self.state.trial_name = arg.trial_name
         self._set_seed() # set again
         
-        train_dataset, eval_dataset = self.get_dataset().values()
+        assert self.train_dataset is not None 
+        assert self.eval_dataset is not None
         should_eval = True if self.eval_dataset is not None else False
         
         if self.optimizer is None or self.scheduler is None:
@@ -177,15 +174,16 @@ class Trainer:
                     scheduler=self.scheduler,
                     training_config=arg,
                     training_state=self.state
-                )
+                ) #TODO: ensuring when resume_from_checkpoint and that config batch_size, num_process, etc (params which affect resume) is congruent with the loaded config, if not, adjust them accordingly, for now we assume they are the same, ignoring other params
                 self.reload_model = True
                 self._is_model_initialized = True
+                log_on_main(f"Instance loaded from checkpoint: {latest_checkpoint}")
             else:
                 log_on_main("No checkpoint found, training from scratch.")
         
         cuda.empty_cache()      
-        self.dataset_length = {"train": len(train_dataset), "eval": len(self.eval_dataset)}
-    
+        self.dataset_length = {"train": len(self.train_dataset), "eval": len(self.eval_dataset)}
+        
         if reload_model:
             self.model = self._model_post_init(self.model)
         # at this point `model` should be DistributedDataParallel already
@@ -231,76 +229,100 @@ class Trainer:
         for i, v in print_configs.items(): 
             log_on_main(f"|| \033[1m\033[1;31m{i}\033[0m: \033[0;30m{v}\033[0m") 
         D.barrier()
-        prepare_end = time.time() - prepare_start
-        log_on_main(f"Preparation took {prepare_end:.2f} seconds")
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> START TRAINING <<-----------------------------------------------\033[0m")
+        loss_accumulate = 0. 
+        for epoch in range(starting_epoch, num_epochs):
+            
+            self.state.global_epoch = epoch
+            epoch_start_time = time.time()
+            self.model.train()
+            self.model.zero_grad()
+            self.optimizer.zero_grad()
+            
+            if hasattr(self.train_dataset, "set_epoch"):
+                self.train_dataset.set_epoch(epoch)
+            
+            for step, inputs in enumerate(self.train_dataset):
+                while num_batch_to_skip > 0:
+                    num_batch_to_skip -= 1
+                    if num_batch_to_skip == 0:
+                        logger.warning(f"Skipped {num_batch_to_skip} batches")
+                    continue
+                    
+                loss, norm = self.inner_loop(inputs=inputs) # the input contain only dict Tensor, any arg to model.forward should be implemented in `sample` method      
+                loss_accumulate += loss # already call .item 
+                self.state.num_batch_training_so_far += 1
+                
+                if self.writer is not None:
+                    
+                    self.writer.add_scalar("Loss/Train", loss, self.state.num_batch_training_so_far)
+                    self.writer.add_scalar("LR", self.scheduler.get_last_lr()[0], self.state.num_batch_training_so_far)
+                    if self._should_log_flops:
+                        self.writer.add_scalar("accumulate_Flops/Train", self._acc_FLOPS, self.state.num_batch_training_so_far)
+                        self.writer.add_scalar("current_Flops/Train", self._curr_FLOPS, self.state.num_batch_training_so_far)
+                    if norm is not None:
+                        self.writer.add_scalar("Gradient_Norm/Train", norm, self.state.num_batch_training_so_far)
+                    
+                if self.state.num_batch_training_so_far + 1 % arg.log_interval == 0:
+                    if D.get_rank() == 0:
+                        loss_accumulate = loss_accumulate / arg.log_interval
+                        lr = self.scheduler.get_last_lr()[0]
+                        message = f"EPOCH: {epoch}, GLOBAL_TRAINING_STEPS: {self.state.global_training_step}, BATCH_STEPS: {step}, LOSS: {loss_accumulate:.10f}, LR: {lr:.10f}" 
+                        logger.warning(message)
+                    D.barrier()
+                    
+                if self.state.num_batch_training_so_far + 1 % arg.checkpoint_interval == 0:
+                    if D.get_rank() == 0:
+                        save_checkpoint(
+                            checkpoint_dir=self.output_trial_dir,
+                            model=self.model, 
+                            optimizer=self.optimizer, 
+                            scheduler=self.scheduler, 
+                            training_config=arg, 
+                            training_state=self.state, 
+                        )
+                        logger.warning(f"Checkpoint saved at global_training_step: {self.state.global_training_step}")
+                    D.barrier()
+
+                if self.state.global_training_step >= total_training_steps: 
+                    logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
+                    break 
+            self.state.global_epoch += 1
+            epoch_end_time = time.time()
+            epoch_time = epoch_end_time - epoch_start_time
+            logger.warning(f"Epoch {epoch} took {epoch_time:.2f} seconds")
+            
+        self.state.is_in_train = False  
+        D.barrier()
+        log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
         
-        on_trace = False if self.tb_log_dir is None else torch.profiler.tensorboard_trace_handler(self.tb_log_dir)
+    def get_one_training_sample(self, *args, **kwargs):
+        '''Get one training batch sample.'''
+        raise NotImplementedError
+    
+    def run_on_profiler(self, num_iteration=20, output_dir=None, *args, **kwargs):
+        """Naive run some training steps on profiler."""
+        output_dir = output_dir if output_dir is not None else os.path.join(self.tb_log_dir, profiler_log_dir)
+        on_trace = torch.profiler.tensorboard_trace_handler(output_dir)
+        log_on_main(f"Profiling trace will be saved at {output_dir}")
+        activity = [torch.profiler.ProfilerActivity.CPU]
+        if cuda.is_available(): activity.append(torch.profiler.ProfilerActivity.CUDA)
+        
         with torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=3, warmup=2, active=5, repeat=5),
+            activities=activity,
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
             on_trace_ready=on_trace,
             profile_memory=True,
             with_flops=True,
-            with_modules=True,
-            use_cuda=cuda.is_available(),
-            with_stack=True
+            with_modules=True
         ) as prof:
-            
-            for epoch in range(starting_epoch, num_epochs):
-                
-                self.state.global_epoch = epoch
-                epoch_start_time = time.time()
-                self.model.train()
-                self.model.zero_grad()
-                self.optimizer.zero_grad()
-                
-                if hasattr(self.train_dataset, "set_epoch"):
-                    self.train_dataset.set_epoch(epoch)
-                
-                for step, inputs in enumerate(self.train_dataset):
-                    while num_batch_to_skip > 0:
-                        num_batch_to_skip -= 1
-                        if num_batch_to_skip == 0:
-                            logger.warning(f"Skipped {num_batch_to_skip} batches")
-                        continue
-                        
-                    loss = self.inner_loop(inputs=inputs)       
-                    self.state.num_batch_training_so_far += 1
-
-                    if self.state.num_batch_training_so_far % arg.log_interval == 0:
-                        if D.get_rank() == 0 and D.get_rank() == 0:
-                            loss = loss / arg.log_interval
-                            lr = self.scheduler.get_last_lr()[0]
-                            message = f"EPOCH: {epoch}, GLOBAL_TRAINING_STEPS: {self.state.global_training_step}, BATCH_STEPS: {step}, LOSS: {loss:.4f}, LR: {lr:.4f}" 
-                            logger.warning(message)
-                            self.writer.add_scalar("train/loss", loss, self.state.global_training_step)
-                            self.writer.add_scalar("train/lr", lr, self.state.global_training_step)
-                        D.barrier()
-                        
-                    if self.state.num_batch_training_so_far % arg.checkpoint_interval == 0:
-                        if D.get_rank() == 0:
-                            save_checkpoint(
-                                checkpoint_dir=self.output_trial_dir,
-                                model=self.model, 
-                                optimizer=self.optimizer, 
-                                scheduler=self.scheduler, 
-                                training_config=arg, 
-                                training_state=self.state, 
-                            )
-                            logger.warning(f"Checkpoint saved at global_training_step: {self.state.global_training_step}")
-                        D.barrier()
-                    
-                    prof.step() # we will profile every step (batch)
-                self.state.global_epoch += 1
-                epoch_end_time = time.time()
-                epoch_time = epoch_end_time - epoch_start_time
-                logger.warning(f"Epoch {epoch} took {epoch_time:.2f} seconds")
-                if self.state.global_training_step >= total_training_steps:
-                    logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
-                    break
-            self.state.is_in_train = False  
-            D.barrier()
-            log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
+            for i in range(num_iteration):
+                with torch.profiler.record_function("Fetching Data"):
+                    batch = self.get_one_training_sample()
+                    batch = self.sample(batch)
+                _ = self.inner_loop(inputs=batch)
+                prof.step()
+        print(prof.key_averages().table(row_limit=200))
         
     def sample(self, inputs, *args, **kwargs):
         """Override this method for custome behavior for how the inputs should be sampled."""
@@ -310,14 +332,10 @@ class Trainer:
             raise ValueError("Empty sample provided.")
         if self.config.dispatch_on_device:
             inputs = _put(inputs, device=self._device, non_blocking=self.config.non_blocking)
-        if not "labels" in inputs: # assume this is causal generation task
-            try:
-                labels = inputs["input_ids"].clone() 
-            except AttributeError:
-                labels = inputs["input_ids"] # just a list
-            inputs["labels"] = labels
-        # if self.config.model_input_name not in inputs: ######## TODO
-        #     raise ValueError(f"Key {self.config.model_input_name} not found in inputs, found keys: {list(sample.keys())}")
+            
+        for name in self.config.model_input_name:
+            if name not in inputs:
+                raise ValueError(f"Model input name {name} not found in inputs.")
         if not self.state.is_in_train and self.config.past_input_name is not None \
             and self.config.past_input_name in inputs: # in eval mode and past is provided
             self._past = inputs[self.config.past_input_name]
@@ -342,38 +360,38 @@ class Trainer:
     
     def step(self, loss):
         '''Stepping optimizer and scheduler. Wiill do necessary scaling here'''
-        if self.gradient_scaler is not None:
-            self.gradient_scaler.scale(loss).backward()
+        self.gradient_scaler.scale(loss).backward()
         loss = loss.detach()
+        
         if self.should_sync: # gradient synchronous steps
-            if self.gradient_scaler is not None:
                 
-                self.gradient_scaler.unscale_(self.optimizer)# explicitly call upscale for clipping
-                if self.config.gradient_clip_norm > 0.:
-                    torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.config.gradient_clip_norm)
-                if self.config.gradient_clip_value > 0.:
-                    torch.nn.utils.clip_grad_value_(self.model.module.parameters(), self.config.gradient_clip_value)
+            self.gradient_scaler.unscale_(self.optimizer)# explicitly call upscale for clipping
+            norm = None 
+            if self.config.gradient_clip_norm > 0.:
+                norm = torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.config.gradient_clip_norm)
+                norm = norm.item()
                 
-                self.gradient_scaler.step(self.optimizer) # will not internally call `unscale_` again
-                self.gradient_scaler.update() 
-            else: 
-                self.optimizer.step()
-                
+            if self.config.gradient_clip_value > 0.:
+                torch.nn.utils.clip_grad_value_(self.model.module.parameters(), self.config.gradient_clip_value)
+            
+            self.gradient_scaler.step(self.optimizer) # will not internally call `unscale_` again
+            self.gradient_scaler.update() 
+
             self.scheduler.step()
             self.optimizer.zero_grad()
             self.state.global_training_step += 1
         
-        return loss 
+        return loss, norm
     
     def inner_loop(self, inputs, *args, **kwargs):
         """Inner training loop, reponsible for forward, backwarn pass, optimizer and lr step, and gradient accumulation."""
         
         with self.accumulate(self.model):
-            with torch.autocast(enabled=self.config.mixed_precision != "off", cache_enabled=False):
+            with torch.autocast(device_type=self.config.device, enabled=self.config.mixed_precision != "off", cache_enabled=False):
                 loss = self.compute_loss(inputs)
                 loss = loss / self.config.gradient_accumulation_steps
         
-        loss = self.step(loss)
+        loss, norm = self.step(loss)
         self.state.loss = loss
         if self.config.report_nan:
             if torch.isnan(loss) or torch.isinf(loss):
@@ -384,7 +402,7 @@ class Trainer:
             self._curr_FLOPS = self.model.floating_point_ops(inputs)
             self._acc_FLOPS += self._curr_FLOPS
             
-        return loss
+        return loss, norm
 
     def compute_loss(self, inputs, *args, **kwargs):
         """Override this for custome behavior"""
@@ -418,9 +436,6 @@ class Trainer:
         eval_loss = eval_loss / num_eval_steps
         eval_time = time.time() - start_time
         log_on_main(f"Evaluation loss: {eval_loss:.4f}, time: {eval_time:.2f}")
-        
-    def get_one_training_sample(self, *args, **kwargs):
-        '''Get one training batch sample.'''
         
     def create_prepared_dataset(self, dataset: Dataset, group=True, *args, **kwargs) -> DataLoader:
         """Create the prepared dataset."""
@@ -487,16 +502,17 @@ class Trainer:
 
         if not isinstance(dataset, Dataset):
             raise ValueError(f"Dataset must be of type `Dataset`, got: {type(dataset)}")
-        return self.create_prepared_dataset(dataset, *args, **kwargs)
-    
+        self.train_dataset = self.create_prepared_dataset(dataset, *args, **kwargs)
+
     def create_eval_dataset(self, dataset=None, *args, **kwargs) -> DataLoader:
         """Create the evaluation dataset. Either override and then call `super().create_eval_dataset` or provide a dataset in kwargs. Override this method for custom behavior."""
         if dataset is None:
             log_on_main(f"No eval dataset provided, no evaluation will be performed.")
-            return None
+            self.eval_dataset = None
+            return 
         if not isinstance(dataset, Dataset):
             raise ValueError(f"Dataset must be of type `Dataset`, got: {type(dataset)}")
-        return self.create_prepared_dataset(dataset, *args, **kwargs)
+        self.eval_dataset = self.create_prepared_dataset(dataset, *args, **kwargs)
         
     def model_initialize(self, *args, **kwargs):
         """Override this method for custom model initialization."""
@@ -508,3 +524,4 @@ class Trainer:
             raise ValueError(f"Can not initialize optimizer and scheduler without model being initialized.")
         return create_optimizer_and_lr(self, self.config.optimizer_kwargs, self.config.scheduler_kwargs)
     
+
