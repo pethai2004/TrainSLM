@@ -1,13 +1,15 @@
 # Full training script 
+#TODO: minimize idle time when use multiple GPUs: 
+
 import os 
 import logging 
-from typing import Dict, Any, Union, Tuple
-from contextlib import contextmanager, ExitStack, nullcontext
+from typing import Dict, Any
 
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler, schedule
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import Dataset
 import transformers as tfm
@@ -20,7 +22,6 @@ from dist import _put
 from data_utility import *
 
 logger = logging.getLogger(__name__)
-
 class Trainer:
     '''Main trainer class for training the model.'''
     
@@ -52,15 +53,15 @@ class Trainer:
         self._should_skip_update = False # indicate that the current loss is NaN or Inf
         self._should_log_flops = False
         self._model_num_params = None 
-        self._step = 0  
+        self._train_iterator = None
+        self._steps = 0  
         self._collate_fn = collate_fn
+        self._done_training = False 
         self.should_sync = False
         self.train_dataset = kwargs.get("train_dataset", None)
         self.eval_dataset = kwargs.get("eval_dataset", None)
         self.optimizer = kwargs.get("optimizer", None)
         self.scheduler = kwargs.get("scheduler", None)
-        self._train_dataset_iter = None
-        self._eval_dataset_iter = None
         
         os.makedirs(self.output_trial_dir, exist_ok=True)
         self.state = TrainingState()
@@ -84,6 +85,13 @@ class Trainer:
             if self.config.tokenizer_name_or_path is not None:
                 self.tokenizer = get_tokenizer(self.config.tokenizer_path)
         self.tb_log_dir = None # will be set later
+    
+    @property
+    def _current_training_per_device_batch_size(self):
+        if self.train_dataset is None:
+            return -1 
+        else:
+            return self.train_dataset.batch_size
         
     @property
     def _device(self):
@@ -114,6 +122,9 @@ class Trainer:
     def _model_post_init(self, model):
         
         assert self.tokenizer is not None, "Tokenizer must be initialized before calling `_model_post_init`."
+        if not isinstance(model, tfm.PreTrainedModel):
+            log_on_main(f"Model is not of type `PreTrainedModel`, this may lead to unexpected behavior.")
+            
         if hasattr(model, "get_input_embeddings"):
             if not model.get_input_embeddings() == len(self.tokenizer):
                 model.resize_token_embeddings(len(self.tokenizer))
@@ -132,9 +143,10 @@ class Trainer:
         if isinstance(model, nn.Module):
             self._model_num_params = model.num_parameters()
             device = self._device
-            model.to(device=device, dtype=torch.float32) #TODO change config dtype, and option for mixed precision
+            model.to(device=device, dtype=torch.float32)
             device_ids = None if not cuda.is_available() else [device]
             model = DDP(model, device_ids=device_ids, output_device=device) # just set output_device to the current device (TODO: add Parallel)
+        
         return model
             
     def _init_tensorboard(self, dir_path: str=None):
@@ -229,12 +241,13 @@ class Trainer:
         for i, v in print_configs.items(): 
             log_on_main(f"|| \033[1m\033[1;31m{i}\033[0m: \033[0;30m{v}\033[0m") 
         D.barrier()
+        log_on_main(f"Run on Profiler")
+        self.run_on_profiler()
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> START TRAINING <<-----------------------------------------------\033[0m")
-        loss_accumulate = 0. 
+        loss_accumulate, start_time = 0.0, time.time()
         for epoch in range(starting_epoch, num_epochs):
             
             self.state.global_epoch = epoch
-            epoch_start_time = time.time()
             self.model.train()
             self.model.zero_grad()
             self.optimizer.zero_grad()
@@ -246,32 +259,38 @@ class Trainer:
                 while num_batch_to_skip > 0:
                     num_batch_to_skip -= 1
                     if num_batch_to_skip == 0:
-                        logger.warning(f"Skipped {num_batch_to_skip} batches")
+                        log_on_main(f"Skipped {num_batch_to_skip} batches")
+                        D.barrier()
                     continue
                     
                 loss, norm = self.inner_loop(inputs=inputs) # the input contain only dict Tensor, any arg to model.forward should be implemented in `sample` method      
                 loss_accumulate += loss # already call .item 
                 self.state.num_batch_training_so_far += 1
                 
-                if self.writer is not None:
+                if self.writer is not None and D.get_rank() == 0:
                     
-                    self.writer.add_scalar("Loss/Train", loss, self.state.num_batch_training_so_far)
-                    self.writer.add_scalar("LR", self.scheduler.get_last_lr()[0], self.state.num_batch_training_so_far)
+                    self.writer.add_scalar("Train/loss", loss, self.state.num_batch_training_so_far)
+                    self.writer.add_scalar("Train/learning_rate", self.scheduler.get_last_lr()[0], self.state.num_batch_training_so_far)
                     if self._should_log_flops:
-                        self.writer.add_scalar("accumulate_Flops/Train", self._acc_FLOPS, self.state.num_batch_training_so_far)
-                        self.writer.add_scalar("current_Flops/Train", self._curr_FLOPS, self.state.num_batch_training_so_far)
+                        self.writer.add_scalar("Train/accumulate_Flops", self._acc_FLOPS, self.state.num_batch_training_so_far)
+                        self.writer.add_scalar("Train/current_Flops", self._curr_FLOPS, self.state.num_batch_training_so_far)
                     if norm is not None:
-                        self.writer.add_scalar("Gradient_Norm/Train", norm, self.state.num_batch_training_so_far)
-                    
+                        self.writer.add_scalar("Train/gradient_norm", norm, self.state.num_batch_training_so_far)
+                
                 if self.state.num_batch_training_so_far + 1 % arg.log_interval == 0:
                     if D.get_rank() == 0:
                         loss_accumulate = loss_accumulate / arg.log_interval
                         lr = self.scheduler.get_last_lr()[0]
-                        message = f"EPOCH: {epoch}, GLOBAL_TRAINING_STEPS: {self.state.global_training_step}, BATCH_STEPS: {step}, LOSS: {loss_accumulate:.10f}, LR: {lr:.10f}" 
-                        logger.warning(message)
+                        elapsed_time = time.time() - start_time
+                        start_time = time.time()
+                        message = f"\033[1;34mEPOCH\033[0m: {epoch}, \033[1;34mGLOBAL_TRAINING_STEPS\033[0m: {self.state.global_training_step}, \033[1;34mBATCH_STEPS\033[0m: {step}, \033[1;34mLOSS\033[0m: {loss_accumulate:.10f}, \033[1;34mLR\033[0m: {lr:.10f}, \033[1;34mTIME\033[0m: {elapsed_time:.2f}"
+                        log_on_main(message)
                     D.barrier()
-                    
-                if self.state.num_batch_training_so_far + 1 % arg.checkpoint_interval == 0:
+                
+                if ((self.state.num_batch_training_so_far + 1 % arg.checkpoint_interval == 0 
+                    and self.state.num_batch_training_so_far > arg.checkpoint_interval)
+                    or self.state.num_batch_training_so_far == total_training_steps - 1 # last step
+                    ):
                     if D.get_rank() == 0:
                         save_checkpoint(
                             checkpoint_dir=self.output_trial_dir,
@@ -288,41 +307,57 @@ class Trainer:
                     logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
                     break 
             self.state.global_epoch += 1
-            epoch_end_time = time.time()
-            epoch_time = epoch_end_time - epoch_start_time
-            logger.warning(f"Epoch {epoch} took {epoch_time:.2f} seconds")
-            
+        
         self.state.is_in_train = False  
         D.barrier()
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
-        
+        self._done_training = True 
+        push_model(self)
+            
     def get_one_training_sample(self, *args, **kwargs):
         '''Get one training batch sample.'''
-        raise NotImplementedError
+        if self._train_iterator is None:
+            self._train_iterator = repeat(self.train_dataset, n=-1) # fixed this
+        try:
+            return next(self._train_iterator)
+        except StopIteration:
+            log_on_main(f"Training iterator exhausted")
+            return 
     
-    def run_on_profiler(self, num_iteration=20, output_dir=None, *args, **kwargs):
+    def run_on_profiler(self, *args, **kwargs): ### may be move this entirely to `Trainer.train()`
         """Naive run some training steps on profiler."""
-        output_dir = output_dir if output_dir is not None else os.path.join(self.tb_log_dir, profiler_log_dir)
-        on_trace = torch.profiler.tensorboard_trace_handler(output_dir)
+        if self.config.num_profile_steps == 0:
+            return 
+
+        if self.tb_log_dir is None:
+            self._init_tensorboard()
+        output_dir = os.path.join(self.tb_log_dir, profiler_log_dir)
+        on_trace = tensorboard_trace_handler(output_dir)
         log_on_main(f"Profiling trace will be saved at {output_dir}")
-        activity = [torch.profiler.ProfilerActivity.CPU]
-        if cuda.is_available(): activity.append(torch.profiler.ProfilerActivity.CUDA)
+        activity = [ProfilerActivity.CPU]
+        if cuda.is_available(): 
+            activity.append(ProfilerActivity.CUDA)
+        start_time = time.time()
         
-        with torch.profiler.profile(
+        with profile(
             activities=activity,
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            schedule=schedule(wait=1, warmup=1, active=3, repeat=self.config.num_profile_steps),
             on_trace_ready=on_trace,
             profile_memory=True,
             with_flops=True,
             with_modules=True
         ) as prof:
-            for i in range(num_iteration):
-                with torch.profiler.record_function("Fetching Data"):
+            for i in range(self.config.num_profile_steps * 5): # multiply by 5 
+                with record_function("Fetching Data"):
                     batch = self.get_one_training_sample()
                     batch = self.sample(batch)
                 _ = self.inner_loop(inputs=batch)
                 prof.step()
-        print(prof.key_averages().table(row_limit=200))
+        done = time.time() - start_time
+        self._steps = 0 # reset steps
+        if D.get_rank() == 0:
+            log_on_main(f"Profiling done in {done:.2f} seconds with {self.config.num_profile_steps} train iterations.")
+            #print(prof.key_averages().table(row_limit=200))
         
     def sample(self, inputs, *args, **kwargs):
         """Override this method for custome behavior for how the inputs should be sampled."""
@@ -362,11 +397,10 @@ class Trainer:
         '''Stepping optimizer and scheduler. Wiill do necessary scaling here'''
         self.gradient_scaler.scale(loss).backward()
         loss = loss.detach()
-        
-        if self.should_sync: # gradient synchronous steps
+        norm = 0. 
+        if self.should_sync and not self._should_skip_update: # gradient synchronous steps
                 
             self.gradient_scaler.unscale_(self.optimizer)# explicitly call upscale for clipping
-            norm = None 
             if self.config.gradient_clip_norm > 0.:
                 norm = torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), self.config.gradient_clip_norm)
                 norm = norm.item()
@@ -387,8 +421,8 @@ class Trainer:
         """Inner training loop, reponsible for forward, backwarn pass, optimizer and lr step, and gradient accumulation."""
         
         with self.accumulate(self.model):
-            with torch.autocast(device_type=self.config.device, enabled=self.config.mixed_precision != "off", cache_enabled=False):
-                loss = self.compute_loss(inputs)
+            with torch.autocast(device_type=self.config.device, dtype=self.config.precision, enabled=self.config.mixed_precision != "off", cache_enabled=False):
+                loss = self.compute_loss(inputs, *args, **kwargs)
                 loss = loss / self.config.gradient_accumulation_steps
         
         loss, norm = self.step(loss)
@@ -503,7 +537,7 @@ class Trainer:
         if not isinstance(dataset, Dataset):
             raise ValueError(f"Dataset must be of type `Dataset`, got: {type(dataset)}")
         self.train_dataset = self.create_prepared_dataset(dataset, *args, **kwargs)
-
+        
     def create_eval_dataset(self, dataset=None, *args, **kwargs) -> DataLoader:
         """Create the evaluation dataset. Either override and then call `super().create_eval_dataset` or provide a dataset in kwargs. Override this method for custom behavior."""
         if dataset is None:
@@ -524,4 +558,3 @@ class Trainer:
             raise ValueError(f"Can not initialize optimizer and scheduler without model being initialized.")
         return create_optimizer_and_lr(self, self.config.optimizer_kwargs, self.config.scheduler_kwargs)
     
-

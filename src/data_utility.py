@@ -252,3 +252,12 @@ def collate_func(x):
     x = {key: [x_i[key] for x_i in x] for key in all_keys}
     
     return x 
+
+def repeat(dataloader, n: int=-1):
+    c = 0
+    while True:
+        for data in dataloader:
+            yield data
+        c += 1
+        if c == n and n != -1:
+            break

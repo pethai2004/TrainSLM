@@ -99,7 +99,6 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     lr_update_strategy: str = field(default="step", metadata={"help": "Strategy for updating learning rate. Available options: 'step', 'epoch', 'plateau'."})
     push_to_hub_model_id: str = field(default="", metadata={"help": "Model ID for pushing to hub. If empty string is provided, do not push."})
     token: str = field(default="", metadata={"help": "Token for hub access. Must be provided if push_to_hub_model_id is provided."})
-    
     disable_hf_progress_bar: bool = field(default=True, metadata={"help": "Disable Hugging Face progress bar."})
     model_max_shard_size: int = field(default=1, metadata={"help": "Maximum model shard size (in GB)."})
     max_checkpoint: int = field(default=8, metadata={"help": "Maximum number of checkpoints. If -1, keep all checkpoints. If 0, do not save checkpoints."})
@@ -125,6 +124,8 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     dispatch_on_device : bool = field(default=False, metadata={"help": "Automatically dispatch the input to appropriate device`"})
     persistent_workers : bool = field(default=False, metadata={"help": "Keep the workers alive between iterations. Argument to `DataLoader`."})
     enable_hp_search: bool = field(default=False, metadata={"help": "Enable hyperparameter search for predefined default hyperparameters. (currently not supported)"})
+    num_profile_steps: int = field(default=5, metadata={"help": "Number of steps for profiling. If 0, do not profile."})
+    
     is_post_init = False 
     
     def _post_init(self, force=False):
@@ -261,6 +262,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
         if self.attn_implementation not in ["sdpa", "flash_attention_2", "eager"]:
             raise ValueError(f"Invalid attention implementation: {self.attn_implementation}, available options: 'sdpa', 'flash_attention_2', 'eager'.")
         
+        assert self.num_profile_steps >= 0, "num_profile_steps must be non-negative."
         log_on_main(f"Done config post init")
         self.is_post_init = True
         
@@ -272,7 +274,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
         elif self.mixed_precision == 'bfp16':
             return torch.bfloat16 
         elif self.mixed_precision == "off":
-            return torch.float32
+            return torch.float32 # always training in fp32
         else:
             raise ValueError(f"Invalid mixed precision: {self.mixed_precision}, available options: 'fp16', 'bfp16', 'off'.")
         

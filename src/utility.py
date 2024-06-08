@@ -244,3 +244,21 @@ def calculate_grad_penalty(loss, params, create_graph=True):
     loss += norm.sqrt() 
     
     return loss 
+
+def _ensure_congruent_config(old_config: TrainingConfig, loaded_config:TrainingConfig, training_state: TrainingState, 
+                             force_reload_optimizer=False, force_reload_scheduler=False):
+    '''
+    Utility for loading training checkpoint. It ensure that model config is the same if `Trainer.model` has be initialized, also optimizer, and scheduler.
+    If the config batch_size, or number of device, etc have been changed, it will automatically adjust the 
+    state accordingly.
+    '''
+    if old_config.per_device_batch_size != loaded_config.per_device_batch_size:
+        log_on_main(f"Received new batch size: {loaded_config.per_device_batch_size}. This may lead to wrong resume training. (Automatic adjustment is not implemented yet)") 
+    if old_config.num_processes != loaded_config.num_processes:
+        log_on_main(f"Received new num_processes: {loaded_config.num_processes}. This may lead to wrong resume training. (Automatic adjustment is not implemented yet)")
+    if old_config.gradient_accumulation_steps != loaded_config.gradient_accumulation_steps:
+        log_on_main(f"Received new gradient_accumulation_steps: {loaded_config.gradient_accumulation_steps}. This may lead to wrong resume training. (Automatic adjustment is not implemented yet)")
+    
+    
+    
+    

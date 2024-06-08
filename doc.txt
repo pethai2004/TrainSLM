@@ -22,7 +22,8 @@ Example:
 Tip Note: 
 
     > When providing custome dataset, it should be strictly of type `datasets.Dataset`.
-
+    > when launching Tensorboard, it should be log to path `config.output_dir/config.trial_name`. This will
+        allow to mornitor different trial single-handledly. 
 
 Future Implementation:
     > Multiple Node Data Distributed scheme

@@ -1,7 +1,26 @@
 
+from transformers import (
+        PreTrainedTokenizerFast, 
+        FalconConfig, 
+        FalconForQuestionAnswering, 
+        FalconForCausalLM,
+    )
+
 from datasets import load_dataset, Dataset
 
-def create_dummy_dataset_v0(tokenizer, length=1024, max_preload=None):
+def create_dummy_model_v0(vocab_size=6000):
+    """Q and A model."""
+    model_config = FalconConfig(
+            vocab_size=vocab_size,
+            num_hidden_layers=10,
+            num_attention_heads=16,
+            hidden_size=128,
+            bias=True,
+            attn_implementation="flash_attention_2",
+        )
+    return FalconForCausalLM(model_config)
+
+def create_dummy_dataset_v0(tokenizer, length=512, max_preload=None):
     name_repo_id = "Owaner/UN_sessions"
     dataset = load_dataset(name_repo_id) 
     if max_preload is not None:

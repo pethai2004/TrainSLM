@@ -2,3 +2,5 @@ transformers
 flash_attn
 tensorboard
 datasets
+accelerate
+torch-tb-profiler
