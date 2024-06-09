@@ -28,3 +28,10 @@ Tip Note:
 Future Implementation:
     > Multiple Node Data Distributed scheme
     > Fine Tuning
+
+
+Run : 
+'chmod +x setup.sh'
+source setup.sh
+
+

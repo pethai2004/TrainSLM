@@ -13,13 +13,14 @@ from torch.profiler import profile, record_function, ProfilerActivity, tensorboa
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import Dataset
 import transformers as tfm
+from huggingface_hub import HfApi
 
-from config import TrainingConfig, TrainingState
-from utility import * 
-from io_utility import *
-from dist import *
-from dist import _put
-from data_utility import *
+from src.config import TrainingConfig, TrainingState
+from src.utility import * 
+from src.io_utility import *
+from src.dist import *
+from src.dist import _put
+from src.data_utility import *
 
 logger = logging.getLogger(__name__)
 class Trainer:
@@ -57,6 +58,7 @@ class Trainer:
         self._steps = 0  
         self._collate_fn = collate_fn
         self._done_training = False 
+        self.latest_checkpoint = None 
         self.should_sync = False
         self.train_dataset = kwargs.get("train_dataset", None)
         self.eval_dataset = kwargs.get("eval_dataset", None)
@@ -103,20 +105,15 @@ class Trainer:
         self.seed = self.config.seed if not self.config.seed_for_each_worker else self.config.seed + D.get_rank()
         set_seed(self.seed, self.config.full_determinism)
         
-    def _create_hgf_repos(self):
+    def _create_hgf_repos(self): 
         """Create HuggingFace repos."""
         if D.get_rank() == 0:
             assert self.config.token is not None, "Token must be provided to create HuggingFace repos."
-            if self.config.push_to_hub_model_id is None:
-                self.config.push_to_hub_model_id = f"{self.output_dir}_{self.config.trial_name}"
-            from huggingface_hub import HfApi
-            api = HfApi()
-            self.repo_id = api.create_repo(self.config.push_to_hub_model_id, exist_ok=True, token=self.config.token).repo_id
-            with open(os.path.join(self.output_trial_dir, ".gitignore"), "w+") as gitignore:
-                if "global_training_steps*" not in gitignore:
-                    gitignore.write("global_training_steps*\n")
-                if "global_epochs*" not in gitignore:
-                    gitignore.write("global_epochs*\n")
+            if self.config.repo_id is None: 
+                self.config.repo_id = f"{self.output_dir}_{self.config.trial_name}"
+        
+            api = HfApi(token=self.config.token)
+            self.repo_id = api.create_repo(self.config.repo_id, exist_ok=True).repo_id
         D.barrier()
         
     def _model_post_init(self, model):
@@ -176,9 +173,9 @@ class Trainer:
             if isinstance(resume_from_checkpoint, str) and validate_checkpoint(resume_from_checkpoint):
                 latest_checkpoint = resume_from_checkpoint
             else: # resume_from_checkpoint is True
-                latest_checkpoint = get_latest_checkpoint(self.output_trial_dir)
+                latest_checkpoint = get_latest_checkpoint(self.output_trial_dir) or self.latest_checkpoint 
             if latest_checkpoint is not None:
-                load_checkpoint(
+                self.latest_checkpoint = load_checkpoint(
                     from_safe_tensor=arg.save_safe_tensor,
                     checkpoint_path=latest_checkpoint,
                     model=self.model,
@@ -312,7 +309,7 @@ class Trainer:
         D.barrier()
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> END TRAINING <<-----------------------------------------------\033[0m")
         self._done_training = True 
-        push_model(self)
+        push_model(self) #TODO
             
     def get_one_training_sample(self, *args, **kwargs):
         '''Get one training batch sample.'''

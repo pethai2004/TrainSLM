@@ -8,7 +8,8 @@ import heapq
 import torch
 from torch.utils.data import DataLoader, Sampler
 import torch.distributed as D
-from dist import _put
+
+from src.dist import _put
 # Note that `constant_length_dataset` is generally preferred over `constant_length_dataset_with_sort`
 # as it will produce less example and number of padding # mostly will reduce number of example 
 

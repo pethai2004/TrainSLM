@@ -1,4 +1,4 @@
-# This file contains the configuration
+# This file contains the configuration # TODO: add ZeroRedundancyOptimizer
 import os 
 import psutil
 import argparse
@@ -31,7 +31,7 @@ _default_port = 6006 # default port for tensorboard
 non_decay_cls = (torch.nn.LayerNorm, torch.nn.Embedding)
 default_optim_cls = torch.optim.AdamW
 default_scheduler_cls = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
-default_lr_kwargs = {"eta_min": 0.000002, "num_cosine_restart_factor": 100,"T_mult": 2}
+default_lr_kwargs = {"eta_min": 0.000002, "num_cosine_restart_factor": 200,"T_mult": 2}
 ignore_padding = -100
 
 def _set_global_config_var(name, new_value): 
@@ -40,7 +40,17 @@ def _set_global_config_var(name, new_value):
     if name in globals():
         globals()[name] = new_value
     else: log_on_main(f"Global variable {name} not found, ignoring.")
-    
+
+config_instance_ = None
+state_instance_ = None
+
+def get_config() -> "TrainingConfig":
+    """Returns the singleton instance of TrainingConfig."""
+    global config_instance_
+    if config_instance_ is None:
+        raise RuntimeError("TrainingConfig instance not initialized.")
+    return config_instance_
+
 @dataclass
 class TrainingState:
     
@@ -54,7 +64,17 @@ class TrainingState:
     num_tokens_so_far : int = 0
     num_steps_per_epoch : int = field(default=-1, metadata={"help": "Number of gradient updates per epoch."})
     loss : float = 0.0
+
+    _instance = None
     
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is not None:
+            log_on_main("TrainingState instance already exists.")
+        cls._instance = super(TrainingConfig, cls).__new__(cls)
+        global state_instance_
+        state_instance_ = cls._instance
+        return cls._instance
+
 @dataclass
 class TrainingConfig: #TODO: should `num_processes` be set here since we cannot control from here?
     '''
@@ -96,9 +116,9 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     full_determinism: bool = field(default=False, metadata={"help": "Ensure full determinism in training. Discouraged since it may slow down training."})
     learning_rate: float = field(default=5e-5, metadata={"help": "Initial learning rate."})
     minimum_learning_rate: float = field(default=1e-5, metadata={"help": "Minimum learning rate."})
-    lr_update_strategy: str = field(default="step", metadata={"help": "Strategy for updating learning rate. Available options: 'step', 'epoch', 'plateau'."})
-    push_to_hub_model_id: str = field(default="", metadata={"help": "Model ID for pushing to hub. If empty string is provided, do not push."})
-    token: str = field(default="", metadata={"help": "Token for hub access. Must be provided if push_to_hub_model_id is provided."})
+    lr_update_strategy: str = field(default="step", metadata={"help": "Strategy for updating learning rate. Available options: 'step', 'epoch', 'plateau'. (currently not supported)"})
+    repo_id: str = field(default="", metadata={"help": "Repo ID for pushing to hub checkpointing. If empty string is provided, do not push."})
+    token: str = field(default="", metadata={"help": "Token for hub access. Must be provided if repo_id is provided."})
     disable_hf_progress_bar: bool = field(default=True, metadata={"help": "Disable Hugging Face progress bar."})
     model_max_shard_size: int = field(default=1, metadata={"help": "Maximum model shard size (in GB)."})
     max_checkpoint: int = field(default=8, metadata={"help": "Maximum number of checkpoints. If -1, keep all checkpoints. If 0, do not save checkpoints."})
@@ -108,7 +128,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     log_interval: int = field(default=50, metadata={"help": "Interval for logging to console. If 0, do not log. Default to 50"})
     tensorboard_interval: int = field(default=1, metadata={"help": "Interval for logging to TensorBoard. If 0, do not log to TensorBoard. If 1, log every step. If -1, log according to log_interval. Default to 1"})
     
-    past_input_name: str = field(default="past_key_values", metadata={"help": "Name of the past input."})
+    past_input_name: str = field(default="", metadata={"help": "Name of the past input."})
     model_input_name: list = field(default=("input_ids",), metadata={"help": "A list of model input names."})
     
     num_processes: int = field(default=-1, metadata={"help": "Total number of GPUs. If None or -1, will use all available GPUs."})
@@ -143,11 +163,11 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
             os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
             os.environ['HF_HUB_DISABLE_EXPERIMENTAL_WARNING'] = '1'
             
-        if self.token is None and self.push_to_hub_model_id is not None:
+        if self.token is None and self.repo_id is not None:
             token = os.getenv('HF_TOKEN', None)
             if token is None:
                 raise ValueError("Either provide a token or set the environment variable HF_TOKEN \n \
-                                    if.push_to_hub_model_id is set.")
+                                    if.repo_id is set.")
             self.token = token
         
         assert self.device in ["cuda", "mps", "cpu"], "Only cuda, mps, and cpu devices are supported."
@@ -234,9 +254,9 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
             self.tensorboard_interval = self.log_interval
             log_on_main(f"Tensorboard interval is not provided. Automatically set to log_interval: {self.tensorboard_interval}")
             
-        if self.push_to_hub_interval > 0 and self.push_to_hub_model_id is None:
-            self.push_to_hub_model_id = f"{self.output_dir}_{self.trial_name}"
-            log_on_main(f"Push to hub interval is provided but push_to_hub_model_id is not provided, default push_to_hub_model_id to `{self.push_to_hub_model_id}`")
+        if self.push_to_hub_interval > 0 and self.repo_id is None:
+            self.repo_id = f"{self.output_dir}_{self.trial_name}"
+            log_on_main(f"Push to hub interval is provided but repo_id is not provided, default repo_id to `{self.repo_id}`")
         elif self.push_to_hub_interval == -1:
             self.push_to_hub_interval = self.checkpoint_interval
             log_on_main(f"Push to hub interval is not provided. Automatically set to checkpoint_interval: {self.push_to_hub_interval}")
@@ -329,24 +349,33 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     @property
     def tensorboard_path(self):
         return os.path.join(self.output_dir, self.trial_name, tensorboard_log_dir)
-        
-def parse_arg(config=None):
+    
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is not None:
+            log_on_main("TrainingState instance already exists.")
+        cls._instance = super(TrainingConfig, cls).__new__(cls)
+        global config_instance_ 
+        config_instance_ = cls._instance 
+        return cls._instance
+    
+def parse_arg(parser, config=None, args=None):
     """Parse the arguments and set the fields of the TrainingConfig."""
-    parser = argparse.ArgumentParser(description="Training Configuration")
     if config is None:
         config = TrainingConfig()
-        
-    for f in fields(TrainingConfig):
+
+    for f in fields(config):
         help_text = f.metadata.get("help", "No help available")
         parser.add_argument(f'--{f.name}', type=type(f.default), default=f.default, help=help_text)
-    
-    args = parser.parse_args()
+
+    args = parser.parse_args(args)
     parsed_dict = vars(args)
-    
+
     for field in parsed_dict:
-        # if key is the field of the TrainingConfig, set it 
+        # if key is the field of the TrainingConfig, set it, else ignore
         if field in asdict(config) and parsed_dict[field] is not None:
-            print(f"Setting {field} to {parsed_dict[field]}")  
+            print(f"Setting {field} to {parsed_dict[field]}")
             setattr(config, field, parsed_dict[field])
-    
-    return config 
+
+    return config

@@ -1,9 +1,10 @@
  #TODO: make sharded load and save (transformers.modeling_utils.load_sharded_checkpoint)
- #TODO: alternate the save and load for RAY hyperparameter search, since accelerator will not work with RAYsearch
- 
+ # TODO: add load and save checkpoint for Hub optional if specify config.model_push_to_hub_id / config.token
+ # so I need to modify all of the function related to load and save modeling uility
+ # TODO: ensure model saved from DDP can be loaded back to DDP and vice versa
+ #TODO: delete accelerate
 import os 
 import time
-import socket
 import random
 import shutil
 import pickle
@@ -14,14 +15,18 @@ import torch
 from torch import cuda
 import numpy as np
 
+from huggingface_hub import HfApi
+from huggingface_hub import get_hf_file_metadata, hf_hub_url, repo_info
+from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+
 from accelerate.utils import save, is_xpu_available, is_torch_xla_available
 from accelerate.state import PartialState, DistributedType
 from accelerate.data_loader import IterableDatasetShard, SeedableRandomSampler
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm # type: ignore
     
-from config import *
-from config import _default_port
+from src.config import *
 
 def validate_checkpoint(checkpoint_path: str) -> bool:
     """
@@ -169,7 +174,8 @@ def save_checkpoint(save_on_each_node=False, model_safe_tensor=False, push_model
     
     rotating_checkpoint(train_config.output_dir, trial_name=train_config.trial_name, 
                         max_keep=train_config.max_checkpoint, keep_best=train_config.keep_best)
-    
+    return chk_path
+
 def load_checkpoint(from_safe_tensor=False, **kwargs):
     """
     Load the training checkpoint including model state, optimizer state, scheduler state, random states,
@@ -184,7 +190,7 @@ def load_checkpoint(from_safe_tensor=False, **kwargs):
     
     """
     chk_path = kwargs['checkpoint_path']
-    partial_state = PartialState()
+    partial_state = PartialState() ##
     assert partial_state.distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_CPU, DistributedType.NO], \
         f"Current {partial_state.distributed_type} is not supported for loading checkpoint. Try using direct Accelerator.load_state instead"
         
@@ -270,19 +276,6 @@ def report_speed_metrics(start_time, split="default", num_samples=None, num_step
         
     return result
 
-def get_default_port(default_port=_default_port):
-    def is_port_in_use(port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            return sock.connect_ex(('localhost', port)) == 0
-    if not is_port_in_use(default_port):
-        return default_port
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(('localhost', 0))
-        port = sock.getsockname()[1]
-
-    return port
-
 def push_model(ctx):
     '''Push Model to Hub'''
     if ctx.config.token is None or D.get_rank() != 0:
@@ -301,3 +294,36 @@ def push_model(ctx):
         log_on_main(f"Model saved to {ctx.output_trial_dir}")
     except Exception as e:
         log_on_main(f"Error saving model: {e}")
+#TODO
+def validate_repo_exist(repo_id, repo_type=None, token=None):
+    try:
+        repo_info(repo_id, repo_type=repo_type, token=token)
+        return True
+    except RepositoryNotFoundError:
+        return False
+
+def has_valid_repo_checkpoint(repo_id):
+    '''Checkpoint always be: /output_dir/trial_name/checkpoint_{%Y-%m-%d_%H-%M-%S}'''
+    _config = get_config()
+
+def validate_file_exist():
+    pass 
+
+def load_checkpoint_from_repos_id(repo_id: str):
+    if not validate_repo_exist(repo_id):
+        return  
+    
+def save_checkpoint_to_repos_id(
+    checkpoint_path: str, api: HfApi=None, 
+): 
+    assert os.path.exists(checkpoint_path)
+    assert validate_checkpoint(checkpoint_path)
+    
+    cf = get_config()
+    api = api or HfApi(token=cf.token)
+    
+    api.upload_folder(
+        repo_id=cf.repo_id,
+        folder_path=checkpoint_path,
+        commit_message=f'TrainingCheckpointing: {cf.trial_name}'
+    )

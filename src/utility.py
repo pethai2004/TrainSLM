@@ -12,7 +12,7 @@ from transformers import PreTrainedTokenizerFast, AutoModel
 from transformers.models.auto.modeling_auto import MODEL_MAPPING
 from tokenizers import Tokenizer
 
-from config import * 
+from src.config import * 
 
 logger = logging.getLogger(__name__)
 
