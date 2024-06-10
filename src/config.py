@@ -9,6 +9,7 @@ import torch
 from typing import Union, Dict, Optional
 from dataclasses import dataclass, field, asdict, fields
 
+from huggingface_hub import HfApi
 import torch
 import torch.distributed as D
 
@@ -42,7 +43,6 @@ def _set_global_config_var(name, new_value):
     else: log_on_main(f"Global variable {name} not found, ignoring.")
 
 config_instance_ = None
-state_instance_ = None
 
 def get_config() -> "TrainingConfig":
     """Returns the singleton instance of TrainingConfig."""
@@ -60,21 +60,30 @@ class TrainingState:
     global_epoch : int = field(default=0, metadata={"help": "Global epoch."})
     best_score : float = 0.0
     is_in_train : bool = False 
-    num_batch_training_so_far : int = field(default=0, metadata={"help": "Number of batches trained so far."})
+    num_batch_training_so_far : int = field(default=0, metadata={"help": "Number of batches trained so far."}) # fix
+    num_examples_so_far : int = 0
     num_tokens_so_far : int = 0
     num_steps_per_epoch : int = field(default=-1, metadata={"help": "Number of gradient updates per epoch."})
     loss : float = 0.0
 
-    _instance = None
+    _batch_size = 1
+    log_interval = -1 
+    checkpoint_interval = -1
+    _should_log = False 
+    _should_checkpoint = False 
     
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is not None:
-            log_on_main("TrainingState instance already exists.")
-        cls._instance = super(TrainingConfig, cls).__new__(cls)
-        global state_instance_
-        state_instance_ = cls._instance
-        return cls._instance
-
+    def progress_batch(self):
+        self.num_batch_training_so_far += 1
+        self.num_examples_so_far += self._batch_size
+        if self.log_interval != -1 and self.num_batch_training_so_far % self.log_interval == 0:
+            self._should_log = True
+        if (self.checkpoint_interval != -1 and 
+            self.num_batch_training_so_far % self.checkpoint_interval == 0 and 
+            self.num_batch_training_so_far >= self.checkpoint_interval # TODO: add last step
+        ):
+            
+            self._should_checkpoint = True
+        
 @dataclass
 class TrainingConfig: #TODO: should `num_processes` be set here since we cannot control from here?
     '''
@@ -114,8 +123,8 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     seed: int = field(default=42, metadata={"help": "Seed for random number generation."})
     seed_for_each_worker : bool = field(default=False, metadata={"help": "Each worker will have a different seed: seed_worker = config.seed + rank."}) 
     full_determinism: bool = field(default=False, metadata={"help": "Ensure full determinism in training. Discouraged since it may slow down training."})
-    learning_rate: float = field(default=5e-5, metadata={"help": "Initial learning rate."})
-    minimum_learning_rate: float = field(default=1e-5, metadata={"help": "Minimum learning rate."})
+    learning_rate: float = field(default=0.00001, metadata={"help": "Initial learning rate."})
+    minimum_learning_rate: float = field(default=0.000002, metadata={"help": "Minimum learning rate."})
     lr_update_strategy: str = field(default="step", metadata={"help": "Strategy for updating learning rate. Available options: 'step', 'epoch', 'plateau'. (currently not supported)"})
     repo_id: str = field(default="", metadata={"help": "Repo ID for pushing to hub checkpointing. If empty string is provided, do not push."})
     token: str = field(default="", metadata={"help": "Token for hub access. Must be provided if repo_id is provided."})
@@ -123,8 +132,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     model_max_shard_size: int = field(default=1, metadata={"help": "Maximum model shard size (in GB)."})
     max_checkpoint: int = field(default=8, metadata={"help": "Maximum number of checkpoints. If -1, keep all checkpoints. If 0, do not save checkpoints."})
     keep_best: bool = field(default=False, metadata={"help": "Keep only the best checkpoints when the maximum number of checkpoints is reached, otherwise will keep the latest checkpoints."})
-    checkpoint_interval: int = field(default=1000, metadata={"help": "Interval for saving checkpoints. If 0, do not save checkpoints."})
-    push_to_hub_interval: int = field(default=1000, metadata={"help": "Interval for pushing to hub. If -1, will set to checkpoint_interval. If 0, do not push to hub."})
+    checkpoint_interval: int = field(default=100, metadata={"help": "Interval for saving checkpoints. If 0, do not save checkpoints."})
     log_interval: int = field(default=50, metadata={"help": "Interval for logging to console. If 0, do not log. Default to 50"})
     tensorboard_interval: int = field(default=1, metadata={"help": "Interval for logging to TensorBoard. If 0, do not log to TensorBoard. If 1, log every step. If -1, log according to log_interval. Default to 1"})
     
@@ -248,18 +256,15 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
         if self.tokenizer_name_or_path is None:
             log_on_main("Tokenizer name or path is not provided") # just a warning
 
-        self.log_interval = max(50, self.log_interval)
+        #self.log_interval = max(50, self.log_interval) #delete 
         
         if self.tensorboard_interval == -1:
             self.tensorboard_interval = self.log_interval
             log_on_main(f"Tensorboard interval is not provided. Automatically set to log_interval: {self.tensorboard_interval}")
             
-        if self.push_to_hub_interval > 0 and self.repo_id is None:
-            self.repo_id = f"{self.output_dir}_{self.trial_name}"
-            log_on_main(f"Push to hub interval is provided but repo_id is not provided, default repo_id to `{self.repo_id}`")
-        elif self.push_to_hub_interval == -1:
-            self.push_to_hub_interval = self.checkpoint_interval
-            log_on_main(f"Push to hub interval is not provided. Automatically set to checkpoint_interval: {self.push_to_hub_interval}")
+        if self.repo_id is None:
+            self.repo_id = f"{self.output_dir}"
+            log_on_main(f"Repo ID is not provided. Automatically set to output_dir: {self.repo_id}")
             
         if self.gradient_clip_norm == -1 or self.gradient_clip_norm == "inf":
             self.gradient_clip_norm = 0.0
@@ -284,6 +289,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
         
         assert self.num_profile_steps >= 0, "num_profile_steps must be non-negative."
         log_on_main(f"Done config post init")
+        self.latest_checkpoint = None 
         self.is_post_init = True
         
     @property
@@ -354,7 +360,7 @@ class TrainingConfig: #TODO: should `num_processes` be set here since we cannot 
     
     def __new__(cls, *args, **kwargs):
         if cls._instance is not None:
-            log_on_main("TrainingState instance already exists.")
+            log_on_main("TrainingConfig instance already exists.")
         cls._instance = super(TrainingConfig, cls).__new__(cls)
         global config_instance_ 
         config_instance_ = cls._instance 

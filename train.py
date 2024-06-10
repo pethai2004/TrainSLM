@@ -6,7 +6,7 @@ import torch.distributed as D
 
 from src.config import TrainingConfig, parse_arg
 from src.utility import get_tokenizer
-from common import create_fineweb_dataset, load_one_fineweb_dataset, CausalTrainer
+from common import create_fineweb_dataset, load_one_fineweb_dataset, CausalTrainer, create_fineweb_model
 
 logger = logging.getLogger(__name__)
     
@@ -24,7 +24,9 @@ def main(dataset,
         model=model,
         tokenizer=tokenizer
     )
-    trainer._should_log_flops = True
+    trainer._should_log_flops = False # still error
+    #[rank3]:     return input_dict[self.main_input_name].numel()
+#[rank3]: AttributeError: 'list' object has no attribute 'numel'
     train_data, _ = trainer.split_train_eval(dataset)
     trainer.create_training_dataset(train_data)
     
@@ -46,7 +48,8 @@ if __name__ == "__main__":
     config_parser = argparse.ArgumentParser()
     training_config = parse_arg(config_parser, args=remaining_argv)
     
-    tok = "/Users/owan/Desktop/temporary/TrainSLM/DefaultTokenizer"
+    tok = "/root/TrainSLM/DefaultTokenizer"
+    abs_path = os.path.abspath(tok)
     tokenizer = get_tokenizer(tok=tok)
     
     assert tokenizer.pad_token_id is not None
@@ -64,12 +67,25 @@ if __name__ == "__main__":
         local_dir=args.local_dir,
         cache_dir=args.cache_dir,
         seq_length=args.seq_length,
+        max_preload=args.max_preload
     )
     print(f"Done creating dataset with {len(dataset)} samples")
     
-    # main(
-    #     dataset=dataset,
-    #     tokenizer=tokenizer,
-    #     model=config.model,
-    #     training_config=config.training
-    # )
+    model = create_fineweb_model()
+    training_config.token = "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"
+
+    training_config.dispatch_on_device = True
+    training_config.num_epochs = 20
+    training_config.num_profile_steps = 10
+    training_config.log_interval = 20
+    training_config.checkpoint_interval = 500
+    training_config.per_device_batch_size = 150
+    
+    training_config.max_checkpoint = 3
+    
+    main(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        model=model,
+        training_config=training_config
+    )

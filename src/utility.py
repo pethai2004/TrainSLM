@@ -260,5 +260,3 @@ def _ensure_congruent_config(old_config: TrainingConfig, loaded_config:TrainingC
         log_on_main(f"Received new gradient_accumulation_steps: {loaded_config.gradient_accumulation_steps}. This may lead to wrong resume training. (Automatic adjustment is not implemented yet)")
     
     
-    
-    

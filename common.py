@@ -13,18 +13,18 @@ from preprocess_text import regex_preprocessor
 from src.data_utility import constant_length_dataset_with_sort
 from src.trainer import Trainer
 
-def create_fineweb_model(vocab_size=6000):
+def create_fineweb_model(vocab_size=6000, attn_implementation="flash_attention_2"):
     """Q and A model."""
     model_config = FalconConfig(
             vocab_size=vocab_size,
             num_hidden_layers=12,
             num_attention_heads=16,
-            hidden_size=256,
+            hidden_size=512,
             hidden_dropout=0.05,
             attention_dropout=0.05,
             parallel_attn=False,
             bias=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
         )
     return FalconForCausalLM(model_config)
 
@@ -77,35 +77,38 @@ def load_one_fineweb_dataset(
 def create_fineweb_dataset(
     tokenizer: PreTrainedTokenizerFast,
     local_dir="fineweb",
+    subset="CC-MAIN-2024-10",
     cache_dir="fineweb_cache",
     apply_deconcatenate=True,
     seq_length=512,
     max_preload=-1
 ):
-    path_to_parq = os.path.join(os.path.abspath(local_dir), "data")
+    path_to_parq = os.path.join(os.path.abspath(local_dir), "data", subset) # ./fineweb/data/CC-MAIN-2024-10/*.parquet
     parquet_list_paths = [
         os.path.join(path_to_parq, each) 
-        for each in os.listdir(path_to_parq) if each.endswith(".parquet")
+        for each in os.listdir(path_to_parq) 
     ]
+    
     dataset = Dataset.from_parquet(
         parquet_list_paths,
         cache_dir=cache_dir,
     )
     
     if max_preload != -1 and len(dataset) > max_preload:
+        print(f"Truncating dataset from {len(dataset)} to {max_preload}")
         dataset = dataset.select(range(max_preload))
+        
         
     cols = dataset.column_names
     cols.remove("text")
     dataset = dataset.remove_columns(cols)
     dataset = dataset.map(
-        lambda x: regex_preprocessor(x["text"]),
+        lambda x: regex_preprocessor(x),
         batched=True,
         num_proc=16,
         load_from_cache_file=True,
         drop_last_batch=True,
         batch_size=2024,
-        cache_file_name=cache_dir,
     )
     dataset = dataset.map(
         lambda x: tokenizer(
@@ -114,14 +117,15 @@ def create_fineweb_dataset(
                 truncation=False,
                 return_length = True,
         ),
-        batch_size=1024,
+        batch_size=2024,
         batched=True,
         num_proc=16,
         load_from_cache_file=True,
     )
     
     dataset = dataset.remove_columns("text")
-    
+    dataset = dataset.remove_columns("length") # the `length` column is now irrelevant as we resize all of the samples
+    dataset = dataset.remove_columns('token_type_ids')
     if apply_deconcatenate:
         dataset = dataset.map(
             lambda x: constant_length_dataset_with_sort(
@@ -129,11 +133,13 @@ def create_fineweb_dataset(
                 seq_length=seq_length,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
-            )
+            ),
+            batched=True,
+            num_proc=16,
+            batch_size=2024,
         ) 
     # this is needed since when concat, we may leave out empty list
-    dataset = dataset.remove_columns("length")
-    dataset = dataset.filter(lambda x: len(x["input_ids"]) >= seq_length) 
+    dataset = dataset.filter(lambda x: len(x["input_ids"]) >= seq_length, num_proc=16)
     
     return dataset
 

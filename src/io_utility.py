@@ -4,6 +4,7 @@
  # TODO: ensure model saved from DDP can be loaded back to DDP and vice versa
  #TODO: delete accelerate
 import os 
+import re 
 import time
 import random
 import shutil
@@ -97,10 +98,13 @@ def rotating_checkpoint(output_dir: str, trial_name: str, max_keep: int = 8, kee
 
     checkpoint_states = []
     for chk in all_checkpoints:
-        with open(os.path.join(output_dir, chk, TRAINING_STATE_PATH), 'rb') as f:
-            state = pickle.load(f)
-            checkpoint_states.append((chk, state.best_score))
-
+        try:
+            with open(os.path.join(output_dir, chk, TRAINING_STATE_PATH), 'rb') as f:
+                state = pickle.load(f)
+                checkpoint_states.append((chk, state.best_score))
+        #file folder `checkpoint...` may have been created but not yet written the training state, etc. 
+        except Exception as e:
+            continue
     while len(all_checkpoints) > max_keep:
         if keep_best and checkpoint_states:
             worst_checkpoint = min(checkpoint_states, key=lambda x: x[1])
@@ -126,6 +130,8 @@ def save_checkpoint(save_on_each_node=False, model_safe_tensor=False, push_model
         - data_loader (Optional): torch.utils.data.DataLoader or Tuple[torch.utils.data.DataLoader]
     """
     train_config = kwargs['training_config']
+    train_config.token = None # we need to remove the token before saving the checkpoint as hugginface does not allow saving token
+    train_config.api = None 
     chk_name =f"{CHECKPOINT_PREFIX}{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     chk_path = os.path.join(train_config.output_dir, train_config.trial_name, chk_name)
     os.makedirs(chk_path, exist_ok=True)
@@ -153,12 +159,8 @@ def save_checkpoint(save_on_each_node=False, model_safe_tensor=False, push_model
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
     }
-    if is_xpu_available(): # accelerate 
-        random_state["torch_xpu_manual_seed"] = torch.xpu.get_rng_state_all()
-    else:
-        random_state["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
-    if is_torch_xla_available():
-        random_state["xm_seed"] = xm.get_rng_state()
+    random_state["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
+
     save(random_state, os.path.join(chk_path, "random_state.bin"), save_on_each_node=save_on_each_node)
     pickle.dump(kwargs["training_state"], open(os.path.join(chk_path, TRAINING_STATE_PATH), 'wb'))
     pickle.dump(kwargs["training_config"], open(os.path.join(chk_path, TRAINING_CONFIG_PATH), 'wb'))
@@ -166,14 +168,15 @@ def save_checkpoint(save_on_each_node=False, model_safe_tensor=False, push_model
     if hasattr(kwargs["model"], "config"): ####
         save(kwargs["model"].config, os.path.join(chk_path, "config.json"), save_on_each_node=save_on_each_node)
         
-    if push_model_to_hub:
-        if train_config.push_to_hub_model_id is not None:
-            kwargs["model"].push_to_hub(train_config.push_to_hub_model_id, 
-                                        token=train_config.token, 
-                                        max_shard_size=train_config.model_max_shard_size)
-    
     rotating_checkpoint(train_config.output_dir, trial_name=train_config.trial_name, 
                         max_keep=train_config.max_checkpoint, keep_best=train_config.keep_best)
+    try:
+        save_checkpoint_to_repos_id(
+            checkpoint_path=chk_path, config=train_config, api=kwargs.get("api", None)
+        )
+    except Exception as e:
+        log_on_main(f"Error saving checkpoint to repos: {e}, ignoring...")
+        
     return chk_path
 
 def load_checkpoint(from_safe_tensor=False, **kwargs):
@@ -190,15 +193,11 @@ def load_checkpoint(from_safe_tensor=False, **kwargs):
     
     """
     chk_path = kwargs['checkpoint_path']
-    partial_state = PartialState() ##
-    assert partial_state.distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_CPU, DistributedType.NO], \
-        f"Current {partial_state.distributed_type} is not supported for loading checkpoint. Try using direct Accelerator.load_state instead"
-        
-    map_location = kwargs.get('map_location', None)
+
+    map_location = kwargs.get('map_location', "cpu")
     if map_location is None: 
-        if partial_state.num_processes > 1 and partial_state.distributed_type in (
-            DistributedType.MULTI_GPU, DistributedType.MULTI_CPU):
-                map_location = "on_device"
+        if torch.cuda.is_available() and torch.distributed.get_world_size() > 1:    
+            map_location = "on_device"
         else:
             map_location = "cpu" 
             
@@ -294,36 +293,33 @@ def push_model(ctx):
         log_on_main(f"Model saved to {ctx.output_trial_dir}")
     except Exception as e:
         log_on_main(f"Error saving model: {e}")
-#TODO
+
 def validate_repo_exist(repo_id, repo_type=None, token=None):
     try:
         repo_info(repo_id, repo_type=repo_type, token=token)
         return True
     except RepositoryNotFoundError:
         return False
-
-def has_valid_repo_checkpoint(repo_id):
-    '''Checkpoint always be: /output_dir/trial_name/checkpoint_{%Y-%m-%d_%H-%M-%S}'''
-    _config = get_config()
-
-def validate_file_exist():
-    pass 
-
-def load_checkpoint_from_repos_id(repo_id: str):
-    if not validate_repo_exist(repo_id):
-        return  
     
 def save_checkpoint_to_repos_id(
-    checkpoint_path: str, api: HfApi=None, 
+    checkpoint_path: str, config: TrainingConfig, api: HfApi=None
 ): 
-    assert os.path.exists(checkpoint_path)
-    assert validate_checkpoint(checkpoint_path)
-    
-    cf = get_config()
-    api = api or HfApi(token=cf.token)
+    if api is None:
+        return
+    repo_id = config.repo_id
+    if not validate_repo_exist(config.repo_id, token=api.token):
+        repo_id = api.create_repo(
+            repo_id=config.repo_id,
+            exist_ok=True).repo_id
+    # get the `checkpoint_{%Y-%m-%d_%H-%M-%S}` part
+    path_in_repo = re.search(r'checkpoint_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', checkpoint_path).group(0)
     
     api.upload_folder(
-        repo_id=cf.repo_id,
+        repo_id=repo_id,
+        path_in_repo=path_in_repo,
         folder_path=checkpoint_path,
-        commit_message=f'TrainingCheckpointing: {cf.trial_name}'
+        commit_message=f'Add checkpointing: {checkpoint_path}',
     )
+
+def load_checkpoint_repos(config: TrainingConfig):
+    pass 

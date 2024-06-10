@@ -1,6 +1,6 @@
 # Full training script 
 #TODO: minimize idle time when use multiple GPUs: 
-
+#TODO: use pin memory instead of `_put` for faster data transfer
 import os 
 import logging 
 from typing import Dict, Any
@@ -58,6 +58,7 @@ class Trainer:
         self._steps = 0  
         self._collate_fn = collate_fn
         self._done_training = False 
+        self._token = None
         self.latest_checkpoint = None 
         self.should_sync = False
         self.train_dataset = kwargs.get("train_dataset", None)
@@ -67,6 +68,8 @@ class Trainer:
         
         os.makedirs(self.output_trial_dir, exist_ok=True)
         self.state = TrainingState()
+        self.state.log_interval = self.config.log_interval
+        self.state.checkpoint_interval = self.config.checkpoint_interval
         self._set_seed()
         torch.backends.cuda.enable_flash_sdp(enabled=True) #(always default to flash_attn_2)
         if tfm.modeling_utils.is_flash_attn_2_available():
@@ -82,7 +85,9 @@ class Trainer:
             self._is_model_initialized = True
         self._init_tensorboard()
         if self.config.token is not None:
+            self._token = self.config.token
             self._create_hgf_repos()
+            
         if tokenizer is None: 
             if self.config.tokenizer_name_or_path is not None:
                 self.tokenizer = get_tokenizer(self.config.tokenizer_path)
@@ -108,12 +113,9 @@ class Trainer:
     def _create_hgf_repos(self): 
         """Create HuggingFace repos."""
         if D.get_rank() == 0:
-            assert self.config.token is not None, "Token must be provided to create HuggingFace repos."
-            if self.config.repo_id is None: 
-                self.config.repo_id = f"{self.output_dir}_{self.config.trial_name}"
-        
-            api = HfApi(token=self.config.token)
-            self.repo_id = api.create_repo(self.config.repo_id, exist_ok=True).repo_id
+            assert self.config.token is not None
+            self.api = HfApi(token=self._token)
+            self.repo_id = self.api.create_repo(self.config.repo_id, exist_ok=True).repo_id
         D.barrier()
         
     def _model_post_init(self, model):
@@ -160,13 +162,15 @@ class Trainer:
         self._set_seed() # set again
         
         assert self.train_dataset is not None 
-        assert self.eval_dataset is not None
+        #assert self.eval_dataset is not None
         should_eval = True if self.eval_dataset is not None else False
         
         if self.optimizer is None or self.scheduler is None:
             self.optimizer, self.scheduler = self.create_optimizer_and_scheduler()
             log_on_main(f"Trainer initalized optimizer and scheduler: {self.optimizer.__class__.__name__}, {self.scheduler.__class__.__name__}")
-            
+        
+        num_epochs = arg.num_epochs
+        
         reload_model = False 
         if resume_from_checkpoint is not None:
             latest_checkpoint = None 
@@ -175,7 +179,7 @@ class Trainer:
             else: # resume_from_checkpoint is True
                 latest_checkpoint = get_latest_checkpoint(self.output_trial_dir) or self.latest_checkpoint 
             if latest_checkpoint is not None:
-                self.latest_checkpoint = load_checkpoint(
+                load_checkpoint(
                     from_safe_tensor=arg.save_safe_tensor,
                     checkpoint_path=latest_checkpoint,
                     model=self.model,
@@ -191,14 +195,13 @@ class Trainer:
                 log_on_main("No checkpoint found, training from scratch.")
         
         cuda.empty_cache()      
-        self.dataset_length = {"train": len(self.train_dataset), "eval": len(self.eval_dataset)}
+        self.dataset_length = {"train": len(self.train_dataset), "eval": len(self.eval_dataset) if should_eval else 0}
         
         if reload_model:
             self.model = self._model_post_init(self.model)
         # at this point `model` should be DistributedDataParallel already
         grad_step = self.config.gradient_accumulation_steps
         total_batch_size = arg.full_batch_size 
-        num_epochs = arg.num_epochs
         train_length = self.dataset_length["train"] # in batch already train_length = full_batch_size * num_train_example
         num_update_per_epoch = max(train_length // grad_step, 1)
     
@@ -224,6 +227,7 @@ class Trainer:
 
         num_params = self._model_num_params if self._model_num_params is not None else self.model.module.num_parameters()
         self._steps = self.state.num_batch_training_so_far
+        self.state._batch_size = arg.per_device_batch_size # fix
         print_configs = {
             "num_parameters": num_params,
             "per_device_batch_size": arg.per_device_batch_size,
@@ -238,8 +242,8 @@ class Trainer:
         for i, v in print_configs.items(): 
             log_on_main(f"|| \033[1m\033[1;31m{i}\033[0m: \033[0;30m{v}\033[0m") 
         D.barrier()
-        log_on_main(f"Run on Profiler")
-        self.run_on_profiler()
+        # if arg.num_profile_steps > 0 and not reload_model:
+        #     self.run_on_profiler()
         log_on_main(f"\033[1m\033[32m--------------------------------------------->> START TRAINING <<-----------------------------------------------\033[0m")
         loss_accumulate, start_time = 0.0, time.time()
         for epoch in range(starting_epoch, num_epochs):
@@ -262,19 +266,19 @@ class Trainer:
                     
                 loss, norm = self.inner_loop(inputs=inputs) # the input contain only dict Tensor, any arg to model.forward should be implemented in `sample` method      
                 loss_accumulate += loss # already call .item 
-                self.state.num_batch_training_so_far += 1
+                self.state.progress_batch()
                 
-                if self.writer is not None and D.get_rank() == 0:
+                if self.writer is not None:
                     
-                    self.writer.add_scalar("Train/loss", loss, self.state.num_batch_training_so_far)
-                    self.writer.add_scalar("Train/learning_rate", self.scheduler.get_last_lr()[0], self.state.num_batch_training_so_far)
+                    self.writer.add_scalar(f"{D.get_rank()}/Train/loss", loss, self.state.num_batch_training_so_far)
+                    self.writer.add_scalar(f"{D.get_rank()}/Train/learning_rate", self.scheduler.get_last_lr()[0], self.state.num_batch_training_so_far)
                     if self._should_log_flops:
-                        self.writer.add_scalar("Train/accumulate_Flops", self._acc_FLOPS, self.state.num_batch_training_so_far)
-                        self.writer.add_scalar("Train/current_Flops", self._curr_FLOPS, self.state.num_batch_training_so_far)
+                        self.writer.add_scalar(f"{D.get_rank()}/Train/accumulate_Flops", self._acc_FLOPS, self.state.num_batch_training_so_far)
+                        self.writer.add_scalar(f"{D.get_rank()}/Train/current_Flops", self._curr_FLOPS, self.state.num_batch_training_so_far)
                     if norm is not None:
-                        self.writer.add_scalar("Train/gradient_norm", norm, self.state.num_batch_training_so_far)
-                
-                if self.state.num_batch_training_so_far + 1 % arg.log_interval == 0:
+                        self.writer.add_scalar(f"{D.get_rank()}/Train/gradient_norm", norm, self.state.num_batch_training_so_far)
+
+                if self.state._should_log:
                     if D.get_rank() == 0:
                         loss_accumulate = loss_accumulate / arg.log_interval
                         lr = self.scheduler.get_last_lr()[0]
@@ -283,22 +287,23 @@ class Trainer:
                         message = f"\033[1;34mEPOCH\033[0m: {epoch}, \033[1;34mGLOBAL_TRAINING_STEPS\033[0m: {self.state.global_training_step}, \033[1;34mBATCH_STEPS\033[0m: {step}, \033[1;34mLOSS\033[0m: {loss_accumulate:.10f}, \033[1;34mLR\033[0m: {lr:.10f}, \033[1;34mTIME\033[0m: {elapsed_time:.2f}"
                         log_on_main(message)
                     D.barrier()
+                    self.state._should_log = False
                 
-                if ((self.state.num_batch_training_so_far + 1 % arg.checkpoint_interval == 0 
-                    and self.state.num_batch_training_so_far > arg.checkpoint_interval)
-                    or self.state.num_batch_training_so_far == total_training_steps - 1 # last step
-                    ):
+                if self.state._should_checkpoint and not step < arg.checkpoint_interval:
                     if D.get_rank() == 0:
-                        save_checkpoint(
+                        self.latest_checkpoint = save_checkpoint(
                             checkpoint_dir=self.output_trial_dir,
                             model=self.model, 
                             optimizer=self.optimizer, 
                             scheduler=self.scheduler, 
                             training_config=arg, 
                             training_state=self.state, 
+                            api=self.api
                         )
+                        self.config.latest_checkpoint = self.latest_checkpoint
                         logger.warning(f"Checkpoint saved at global_training_step: {self.state.global_training_step}")
                     D.barrier()
+                    self.state._should_checkpoint = False
 
                 if self.state.global_training_step >= total_training_steps: 
                     logger.warning(f"Training completed at global_training_step: {self.state.global_training_step}")
@@ -429,8 +434,8 @@ class Trainer:
                 logger.error(f"Loss is NaN or Inf at epoch {self.state.global_epoch}, step {self.state.global_training_step}, loss: {loss}")
                 self._should_skip_update = True
         
-        if hasattr(self.model, "floating_point_ops") and self._should_log_flops:
-            self._curr_FLOPS = self.model.floating_point_ops(inputs)
+        if hasattr(self.model.module, "floating_point_ops") and self._should_log_flops:
+            self._curr_FLOPS = self.model.module.floating_point_ops(inputs)
             self._acc_FLOPS += self._curr_FLOPS
             
         return loss, norm
