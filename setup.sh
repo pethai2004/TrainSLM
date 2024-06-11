@@ -5,7 +5,8 @@ python -m venv $VENV_DIR
 source $VENV_DIR/bin/activate
 
 pip3 install --upgrade pip
-pip3 install -r requirements.txt
+pip3 install transformers tensorboard datasets accelerate torch-tb-profiler
+
 
 export PYTHONPATH=$(pwd)
 export NCCL_P2P_DISABLE="1"

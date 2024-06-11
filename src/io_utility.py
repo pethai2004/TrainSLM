@@ -277,22 +277,16 @@ def report_speed_metrics(start_time, split="default", num_samples=None, num_step
 
 def push_model(ctx):
     '''Push Model to Hub'''
-    if ctx.config.token is None or D.get_rank() != 0:
+    if ctx._token is None or D.get_rank() != 0:
         return 
     try:
-        ctx.model.module.push_to_hub(
-            repo_id=ctx.config.push_to_hub_model_id,
-            commit_message=f"Pretrained model from {ctx.config.trial_name}",
-            token=ctx.config.token,
+        ctx.model.module.save_pretrained(
+            save_directory=ctx.output_trial_dir,
+            push_to_hub=True,
+            token=ctx._token,
         )
-        log_on_main(f"Model pushed to Hub with repo_id: {ctx.config.push_to_hub_model_id}")
     except Exception as e:
         log_on_main(f"Error pushing model to Hub: {e}")
-    try: 
-        ctx.model.module.save_pretrained(save_directory=ctx.output_trial_dir)
-        log_on_main(f"Model saved to {ctx.output_trial_dir}")
-    except Exception as e:
-        log_on_main(f"Error saving model: {e}")
 
 def validate_repo_exist(repo_id, repo_type=None, token=None):
     try:
