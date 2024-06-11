@@ -72,7 +72,7 @@ if __name__ == "__main__":
     print(f"Done creating dataset with {len(dataset)} samples")
     
     model = create_fineweb_model()
-    training_config.token = "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"
+    training_config.token = ""
 
     training_config.dispatch_on_device = True
     training_config.num_epochs = 20
