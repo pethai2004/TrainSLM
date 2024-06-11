@@ -66,7 +66,8 @@ output = model.generate(
 output_text = tokenizer.batch_decode(output, skip_special_tokens=True)
 
 for i, o in enumerate(output_text):
-    print(f"Output {i+1}: {o}")```
+    print(f"Output {i+1}: {o}")
+```
 
 example: 
 
