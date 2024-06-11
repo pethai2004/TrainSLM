@@ -32,8 +32,15 @@ Future Implementation:
 
 
 Run : 
+
 'chmod +x setup.sh'
 source setup.sh
 
 then 
 - `torchrun --nproc-per-node=4 train.py --per_device_batch_size=128`
+
+
+example: 
+
+![alt text](https://github.com/pethai2004/TrainSLM/blob/main/tenb.png?raw=true)
+![alt text](https://github.com/pethai2004/TrainSLM/blob/main/prof.png?raw=true)
