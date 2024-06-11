@@ -1,5 +1,9 @@
 # TrainSLM
  Training Small Language Model
+
+You can view example model using this script on Hugginface Model: 
+`https://huggingface.co/Owaner/fineweb-falcon?text=Once+upon+a+time%2C` 
+
 Using Trainer:
 
    The `Trainer` class implement complete training script for Data Distributed Training scheme, and 
@@ -39,6 +43,30 @@ source setup.sh
 then 
 - `torchrun --nproc-per-node=4 train.py --per_device_batch_size=128`
 
+Load example Model Trained on FineWeb using Falcon model from scratch
+
+```
+import transformers as tfm 
+
+model = tfm.AutoModelForCausalLM.from_pretrained("Owaner/fineweb-falcon")
+tokenizer = tfm.PreTrainedTokenizerFast.from_pretrained("Owaner/falcon_tokenizer")
+
+example = "When habitually indulge in "
+tokenized_input = tokenizer(example, return_tensors="pt", return_token_type_ids=False)
+output = model.generate(
+    inputs=tokenized_input["input_ids"],
+    attention_mask=tokenized_input["attention_mask"],
+    do_sample = True,
+    max_length=100,
+    temperature=0.7,
+    top_k=50,
+    top_p=0.95,
+    num_return_sequences=5
+)
+output_text = tokenizer.batch_decode(output, skip_special_tokens=True)
+
+for i, o in enumerate(output_text):
+    print(f"Output {i+1}: {o}")```
 
 example: 
 
